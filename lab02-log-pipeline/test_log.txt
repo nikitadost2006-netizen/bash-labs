@@ -1,0 +1,48 @@
+=== Date: Wed Nov  4 14:04:11 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - version
+ok 3 - missing input
+ok 4 - nonexistent input
+ok 5 - invalid format
+ok 6 - text output
+ok 7 - json output
+ok 8 - strict mode fails on bad line
+ok 9 - top N
+ok 10 - stdin
+1..10
+=== Sample Run (text) ===
+=== Log Report ===
+Total Requests:   992
+Malformed Lines:  8
+Bytes Transferred: 1145596
+Status Codes:     2xx=309, 3xx=211, 4xx=285, 5xx=187
+Response Times:   p50=980ms, p95=1885ms, p99=1978ms
+
+Top 3 URLs:
+    228  /api/v1/items?page=2&limit=50
+    205  /login?user=admin
+    189  /images/logo.png
+
+Top 3 Error IPs (4xx/5xx):
+     96  192.168.1.1
+     84  2001:db8::1
+     77  10.0.0.5
+=== Sample Run (json) ===
+{
+  "total_requests": 992,
+  "malformed_lines": 8,
+  "bytes_transferred": 1145596,
+  "status_codes": {"2xx": 309, "3xx": 211, "4xx": 285, "5xx": 187},
+  "percentiles": {"p50": 980, "p95": 1885, "p99": 1978},
+  "top_urls": [
+    {"url": "/api/v1/items?page=2&limit=50", "count": 228},
+    {"url": "/login?user=admin", "count": 205},
+
+  ],
+  "top_error_ips": [
+    {"ip": "192.168.1.1", "errors": 96},
+    {"ip": "2001:db8::1", "errors": 84},
+
+  ]
+}
