@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+ROOT=""
+POLICY=""
+FORMAT="text"
+FIX=0
+DRY_RUN=0
+
+usage() {
+  cat <<USAGE
+Usage: $PROG --root DIR --policy policy.conf [OPTIONS]
+
+Options:
+  --root DIR         Directory to audit (required)
+  --policy FILE      Path to policy.conf (required)
+  --format text|json Output format (default: text)
+  --fix              Attempt to fix violations (chmod/chown)
+  --dry-run          Show what would be fixed without doing it
+  --help             Show this help
+  --version          Show version
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$PROG $VERSION"; exit 0 ;;
+    --root) [[ $# -ge 2 ]] || die "--root requires argument"; ROOT=$2; shift 2 ;;
+    --root=*) ROOT=${1#*=}; shift ;;
+    --policy) [[ $# -ge 2 ]] || die "--policy requires argument"; POLICY=$2; shift 2 ;;
+    --policy=*) POLICY=${1#*=}; shift ;;
+    --format) [[ $# -ge 2 ]] || die "--format requires argument"; FORMAT=$2; shift 2 ;;
+    --format=*) FORMAT=${1#*=}; shift ;;
+    --fix) FIX=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) die "Unexpected argument: $1" ;;
+  esac
+done
+
+[[ -n $ROOT ]] || die "--root is required"
+[[ -n $POLICY ]] || die "--policy is required"
+[[ -d $ROOT ]] || die "Root directory not found: $ROOT"
+[[ -f $POLICY ]] || die "Policy file not found: $POLICY"
+[[ $FORMAT == "text" || $FORMAT == "json" ]] || die "Invalid format: $FORMAT"
+
+FORBIDDEN_PERMS=""
+ALLOWED_OWNER=""
+ALLOWED_GROUP=""
+MAX_SIZE=0
+FORBID_SYMLINKS="no"
+FORBID_SETUID="no"
+ALLOWED_EXTS=""
+
+POLICY_DATA=$(tr -d '\r' < "$POLICY")
+
+while IFS='=' read -r key value; do
+  [[ -z "$key" || "$key" =~ ^# ]] && continue
+  key=$(echo "$key" | xargs)
+  value=$(echo "$value" | xargs)
+  
+  case "$key" in
+    forbidden_perms) FORBIDDEN_PERMS=$value ;;
+    allowed_owner) ALLOWED_OWNER=$value ;;
+    allowed_group) ALLOWED_GROUP=$value ;;
+    max_size) MAX_SIZE=$value ;;
+    forbid_symlinks_outside) FORBID_SYMLINKS=$value ;;
+    forbid_setuid) FORBID_SETUID=$value ;;
+    allowed_extensions) ALLOWED_EXTS=$value ;;
+  esac
+done <<< "$POLICY_DATA"
+
+VIOLATIONS=0
+JSON_OUTPUT="["
+TEXT_OUTPUT=""
+
+add_violation() {
+  local id=$1
+  local path=$2
+  local actual=$3
+  local expected=$4
+  local severity=$5
+  
+  VIOLATIONS=$((VIOLATIONS+1))
+  
+  if [[ $FORMAT == "json" ]]; then
+    if [[ $VIOLATIONS -gt 1 ]]; then JSON_OUTPUT+=","; fi
+    JSON_OUTPUT+="\n  {\"id\": \"$id\", \"path\": \"$path\", \"actual\": \"$actual\", \"expected\": \"$expected\", \"severity\": \"$severity\"}"
+  else
+    TEXT_OUTPUT+="[$severity] $id | $path | Actual: $actual | Expected: $expected\n"
+  fi
+
+  if [[ $FIX -eq 1 && $DRY_RUN -eq 0 ]]; then
+    case "$id" in
+      PERM_WORLD_WRITABLE) chmod o-w "$path" 2>/dev/null && echo "FIXED: Removed world-writable on $path" >&2 ;;
+      OWNER_MISMATCH) chown "$expected" "$path" 2>/dev/null && echo "FIXED: Changed owner of $path" >&2 ;;
+    esac
+  elif [[ $FIX -eq 1 && $DRY_RUN -eq 1 ]]; then
+    echo "DRY-RUN: Would fix $id on $path" >&2
+  fi
+}
+
+while IFS= read -r -d '' path; do
+  if [[ -L "$path" && "$FORBID_SYMLINKS" == "yes" ]]; then
+    target=$(readlink -f "$path" 2>/dev/null || true)
+    root_abs=$(cd "$ROOT" && pwd -P)
+    if [[ -n "$target" && "$target" != "$root_abs"* ]]; then
+      add_violation "SYMLINK_OUTSIDE" "$path" "-> $target" "Inside $ROOT" "HIGH"
+    fi
+    continue
+  fi
+
+  stat_out=$(stat -c "%a|%s|%U|%G" "$path" 2>/dev/null) || continue
+  IFS='|' read -r perms size owner group <<< "$stat_out"
+
+  if [[ -n "$FORBIDDEN_PERMS" ]]; then
+    if (( (8#$perms & 8#$FORBIDDEN_PERMS) != 0 )); then
+      add_violation "PERM_WORLD_WRITABLE" "$path" "$perms" "No $FORBIDDEN_PERMS" "HIGH"
+    fi
+  fi
+
+  if [[ -n "$ALLOWED_OWNER" ]]; then
+    if [[ ! ",$ALLOWED_OWNER," =~ ",$owner," ]]; then
+      add_violation "OWNER_MISMATCH" "$path" "$owner" "$ALLOWED_OWNER" "MEDIUM"
+    fi
+  fi
+
+  if [[ "$MAX_SIZE" -gt 0 && "$size" -gt "$MAX_SIZE" ]]; then
+    add_violation "SIZE_TOO_LARGE" "$path" "$size" "<= $MAX_SIZE" "LOW"
+  fi
+
+  if [[ "$FORBID_SETUID" == "yes" ]]; then
+    if (( (8#$perms & 8#6000) != 0 )); then
+      add_violation "SUID_SGID" "$path" "$perms" "No setuid/setgid" "CRITICAL"
+    fi
+  fi
+
+  if [[ -n "$ALLOWED_EXTS" ]]; then
+    ext=".${path##*.}"
+    if [[ ! ",$ALLOWED_EXTS," =~ ",$ext," ]]; then
+      add_violation "BAD_EXTENSION" "$path" "$ext" "$ALLOWED_EXTS" "LOW"
+    fi
+  fi
+
+done < <(find "$ROOT" -mindepth 1 -print0 2>/dev/null)
+
+if [[ $FORMAT == "json" ]]; then
+  JSON_OUTPUT+="\n]"
+  echo -e "$JSON_OUTPUT"
+else
+  echo "=== FS Audit Report ==="
+  echo "Root: $ROOT"
+  echo "Violations found: $VIOLATIONS"
+  echo "-----------------------"
+  echo -e "$TEXT_OUTPUT"
+fi
+
+if [[ $VIOLATIONS -gt 0 ]]; then
+  exit 1
+else
+  exit 0
+fi

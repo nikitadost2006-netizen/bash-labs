@@ -1,0 +1,20 @@
+=== Date: Wed Nov  4 14:50:49 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - missing args
+ok 3 - clean dir returns 0
+ok 4 - finds world writable (skipped on Windows)
+ok 5 - finds bad ext
+ok 6 - json output
+ok 7 - missing policy
+ok 8 - bad root dir
+ok 9 - invalid format
+ok 10 - size too large
+1..10
+=== Sample Run ===
+=== FS Audit Report ===
+Root: /tmp/audit_test
+Violations found: 1
+-----------------------
+[LOW] BAD_EXTENSION | /tmp/audit_test/bad.exe | Actual: .exe | Expected: .txt,.sh,.conf
+
