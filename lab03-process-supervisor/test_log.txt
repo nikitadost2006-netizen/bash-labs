@@ -1,0 +1,12 @@
+=== Date: Wed Nov  4 14:25:47 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - success
+ok 3 - failure returns 1
+ok 4 - timeout
+ok 5 - retries count (3 files)
+ok 6 - meta json valid
+1..6
+=== Sample Run (timeout) ===
+All attempts failed.
+Command exited with code 1

@@ -1,0 +1,7 @@
+{
+  "attempt": 0,
+  "command": "sleep 5",
+  "exit_code": 143,
+  "status": "timeout",
+  "elapsed_sec": 1
+}
