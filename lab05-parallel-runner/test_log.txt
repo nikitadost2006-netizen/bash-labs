@@ -1,0 +1,18 @@
+=== Date: Wed Nov  4 15:13:11 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - missing args
+ok 3 - simple task success
+ok 4 - results file populated
+ok 5 - parallel limit enforced
+ok 6 - fail-fast stops next tasks
+ok 7 - keep-going runs next tasks
+ok 8 - retries work
+ok 9 - exit code 0 on success
+ok 10 - exit code 1 on failure
+1..10
+=== Sample Run ===
+Starting parallel execution (max 2 jobs)...
+Collecting results...
+Execution complete. Results saved to ./logs/results.tsv
+WARNING: 2 tasks failed.

@@ -1,0 +1,5 @@
+task1	echo "Task 1 done"; sleep 1
+task2	echo "Task 2 done"; sleep 2
+task3	echo "Task 3 done"; exit 0
+task4	echo "Task 4 fails"; exit 1
+task5	echo "Task 5 fails twice"; exit 2

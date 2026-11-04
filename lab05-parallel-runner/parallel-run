@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+TASKS_FILE=""
+MAX_JOBS=4
+RETRIES=0
+LOG_DIR=""
+FAIL_FAST=0
+KEEP_GOING=1
+ACTIVE_PIDS=()
+
+usage() {
+  cat <<USAGE
+Usage: $PROG --tasks FILE --log-dir DIR [OPTIONS]
+
+Options:
+  --tasks FILE       File with tasks (format: ID<TAB>COMMAND) (required)
+  --log-dir DIR      Directory to save logs and results (required)
+  --parallel N       Max parallel jobs (default: 4)
+  --retries N        Number of retries for a failed task (default: 0)
+  --fail-fast        Stop all tasks on first failure
+  --keep-going       Continue on failure (default)
+  --help             Show this help
+  --version          Show version
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+cleanup() {
+  local ec=$?
+  trap - EXIT INT TERM
+  local active_pids
+  active_pids=$(jobs -pr || true)
+  
+  if [[ -n "$active_pids" ]]; then
+    echo "Stopping active tasks..." >&2
+    for pid in $active_pids; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 0.5
+    for pid in $active_pids; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+  exit "$ec"
+}
+trap cleanup EXIT INT TERM
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$PROG $VERSION"; exit 0 ;;
+    --tasks) [[ $# -ge 2 ]] || die "--tasks requires argument"; TASKS_FILE=$2; shift 2 ;;
+    --tasks=*) TASKS_FILE=${1#*=}; shift ;;
+    --log-dir) [[ $# -ge 2 ]] || die "--log-dir requires argument"; LOG_DIR=$2; shift 2 ;;
+    --log-dir=*) LOG_DIR=${1#*=}; shift ;;
+    --parallel) [[ $# -ge 2 ]] || die "--parallel requires argument"; MAX_JOBS=$2; shift 2 ;;
+    --parallel=*) MAX_JOBS=${1#*=}; shift ;;
+    --retries) [[ $# -ge 2 ]] || die "--retries requires argument"; RETRIES=$2; shift 2 ;;
+    --retries=*) RETRIES=${1#*=}; shift ;;
+    --fail-fast) FAIL_FAST=1; KEEP_GOING=0; shift ;;
+    --keep-going) KEEP_GOING=1; FAIL_FAST=0; shift ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) die "Unexpected argument: $1" ;;
+  esac
+done
+
+[[ -n $TASKS_FILE ]] || die "--tasks is required"
+[[ -f $TASKS_FILE ]] || die "Tasks file not found: $TASKS_FILE"
+[[ -n $LOG_DIR ]] || die "--log-dir is required"
+[[ $MAX_JOBS =~ ^[0-9]+$ && $MAX_JOBS -gt 0 ]] || die "--parallel must be > 0"
+[[ $RETRIES =~ ^[0-9]+$ ]] || die "--retries must be an integer"
+
+mkdir -p "$LOG_DIR"
+RESULTS_FILE="$LOG_DIR/results.tsv"
+echo -e "ID\tEXIT_CODE\tDURATION_SEC" > "$RESULTS_FILE"
+
+run_task() {
+  local task_id=$1
+  local cmd=$2
+  local out_log="$LOG_DIR/${task_id}_stdout.log"
+  local err_log="$LOG_DIR/${task_id}_stderr.log"
+  
+  > "$out_log"
+  > "$err_log"
+
+  local attempt=0
+  local start_time=$(date +%s)
+  local ec=0
+
+  while (( attempt <= RETRIES )); do
+    if bash -c "$cmd" >> "$out_log" 2>> "$err_log"; then
+      ec=0
+      break
+    else
+      ec=$?
+      attempt=$((attempt + 1))
+      if (( attempt <= RETRIES )); then
+        echo "Task $task_id failed (code $ec). Retrying ($attempt/$RETRIES)..." >> "$err_log"
+        sleep 1
+      fi
+    fi
+  done
+
+  local end_time=$(date +%s)
+  local duration=$(( end_time - start_time ))
+  
+  echo -e "${task_id}\t${ec}\t${duration}" > "$LOG_DIR/${task_id}.result"
+}
+
+check_fail_fast() {
+  if [[ $FAIL_FAST -eq 1 ]]; then
+    for res_file in "$LOG_DIR"/*.result; do
+      [[ -e "$res_file" ]] || continue
+      local ec
+      ec=$(awk -F'\t' '{print $2}' "$res_file")
+      if [[ "$ec" != "0" ]]; then
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+echo "Starting parallel execution (max $MAX_JOBS jobs)..."
+
+while IFS=$'\t' read -r task_id cmd || [[ -n "$task_id" ]]; do
+  [[ -z "$task_id" || "$task_id" =~ ^# ]] && continue
+  [[ -z "$cmd" ]] && continue
+
+  # Ждем, пока количество активных процессов не станет меньше MAX_JOBS
+  while (( ${#ACTIVE_PIDS[@]} >= MAX_JOBS )); do
+    set +e
+    wait -n
+    set -e
+    # Удаляем завершенные PID'ы
+    NEW_PIDS=()
+    for pid in "${ACTIVE_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        NEW_PIDS+=("$pid")
+      fi
+    done
+    ACTIVE_PIDS=("${NEW_PIDS[@]}")
+  done
+
+  # Проверяем fail-fast ПОСЛЕ того, как освободилось место (задача завершилась)
+  if check_fail_fast; then
+    echo "Fail-fast triggered. Stopping new tasks." >&2
+    break
+  fi
+
+  run_task "$task_id" "$cmd" &
+  ACTIVE_PIDS+=($!)
+done < <(tr -d '\r' < "$TASKS_FILE")
+
+# Ждем завершения оставшихся задач
+set +e
+for pid in "${ACTIVE_PIDS[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+set -e
+
+echo "Collecting results..."
+for res_file in "$LOG_DIR"/*.result; do
+  [[ -e "$res_file" ]] || continue
+  cat "$res_file" >> "$RESULTS_FILE"
+  rm -f "$res_file"
+done
+
+FAILED_COUNT=$(awk -F'\t' 'NR>1 && $2 != 0 {count++} END {print count+0}' "$RESULTS_FILE")
+
+echo "Execution complete. Results saved to $RESULTS_FILE"
+if [[ $FAILED_COUNT -gt 0 ]]; then
+  echo "WARNING: $FAILED_COUNT tasks failed." >&2
+  exit 1
+fi
+exit 0
