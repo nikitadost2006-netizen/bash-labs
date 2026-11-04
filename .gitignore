@@ -1,0 +1,4 @@
+*.tmp
+*.log
+.file-index.*
+__pycache__/

@@ -1,0 +1,9 @@
+# Автоматически определять текстовые файлы
+* text=auto
+
+# Скрипты Bash всегда должны иметь LF (Unix) переносы строк
+*.sh text eol=lf
+file-index text eol=lf
+
+# Markdown файлы тоже лучше хранить в LF
+*.md text eol=lf
