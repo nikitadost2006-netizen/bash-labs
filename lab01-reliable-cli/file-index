@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+LOG_LEVEL="INFO"
+LOG_LEVEL_NUM=2
+
+ROOT=""
+OUTPUT=""
+FORMAT="csv"
+MAX_SIZE=""
+DRY_RUN=0
+EXCLUDES=()
+TEMP_FILE=""
+
+log() {
+  local level=$1
+  shift
+  local num
+  case "$level" in
+    ERROR) num=0 ;;
+    WARN)  num=1 ;;
+    INFO)  num=2 ;;
+    DEBUG) num=3 ;;
+    *)     level=INFO; num=2 ;;
+  esac
+  if (( num <= LOG_LEVEL_NUM )); then
+    printf '[%s] %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$*" >&2
+  fi
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+Usage: $PROG --root DIR --output FILE [OPTIONS]
+
+Options:
+  --root DIR              Directory to index (required)
+  --output FILE           Output file (required)
+  --format csv|jsonl      Output format (default: csv)
+  --exclude PATTERN       Exclude basename or path matching shell pattern (repeatable)
+  --max-size BYTES        Skip regular files larger than BYTES
+  --dry-run               Show actions without writing output
+  --log-level LEVEL       ERROR, WARN, INFO, DEBUG (default: INFO)
+  --help                  Show this help
+  --version               Show version
+USAGE
+}
+
+cleanup() {
+  local ec=$?
+  trap - EXIT
+  if [[ -n ${TEMP_FILE:-} && -e $TEMP_FILE ]]; then
+    rm -f -- "$TEMP_FILE" || true
+  fi
+  exit "$ec"
+}
+
+trap cleanup EXIT
+trap 'log ERROR "SIGINT received"; exit 130' INT
+trap 'log ERROR "SIGTERM received"; exit 143' TERM
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+
+    --root)
+      [[ $# -ge 2 ]] || die "--root requires argument"
+      ROOT=$2; shift 2 ;;
+    --root=*) ROOT=${1#*=}; shift ;;
+
+    --output)
+      [[ $# -ge 2 ]] || die "--output requires argument"
+      OUTPUT=$2; shift 2 ;;
+    --output=*) OUTPUT=${1#*=}; shift ;;
+
+    --format)
+      [[ $# -ge 2 ]] || die "--format requires argument"
+      FORMAT=$2; shift 2 ;;
+    --format=*) FORMAT=${1#*=}; shift ;;
+
+    --exclude)
+      [[ $# -ge 2 ]] || die "--exclude requires argument"
+      [[ -n $2 ]] || die "--exclude cannot be empty"
+      EXCLUDES+=("$2"); shift 2 ;;
+    --exclude=*)
+      [[ -n ${1#*=} ]] || die "--exclude cannot be empty"
+      EXCLUDES+=("${1#*=}"); shift ;;
+
+    --max-size)
+      [[ $# -ge 2 ]] || die "--max-size requires argument"
+      MAX_SIZE=$2; shift 2 ;;
+    --max-size=*) MAX_SIZE=${1#*=}; shift ;;
+
+    --dry-run) DRY_RUN=1; shift ;;
+    --log-level)
+      [[ $# -ge 2 ]] || die "--log-level requires argument"
+      LOG_LEVEL=$2; shift 2 ;;
+    --log-level=*) LOG_LEVEL=${1#*=}; shift ;;
+
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) die "Unexpected argument: $1" ;;
+  esac
+done
+
+[[ $# -eq 0 ]] || die "Unexpected positional arguments: $*"
+
+case "$LOG_LEVEL" in
+  ERROR) LOG_LEVEL_NUM=0 ;;
+  WARN)  LOG_LEVEL_NUM=1 ;;
+  INFO)  LOG_LEVEL_NUM=2 ;;
+  DEBUG) LOG_LEVEL_NUM=3 ;;
+  *) die "Invalid log level: $LOG_LEVEL" ;;
+esac
+
+[[ -n $ROOT ]] || die "--root is required"
+[[ -n $OUTPUT ]] || die "--output is required"
+
+case "$FORMAT" in
+  csv|jsonl) ;;
+  *) die "Invalid format: $FORMAT" ;;
+esac
+
+if [[ -n $MAX_SIZE && ! $MAX_SIZE =~ ^[0-9]+$ ]]; then
+  die "--max-size must be a non-negative integer"
+fi
+
+[[ -d $ROOT ]] || die "Root is not a directory: $ROOT"
+[[ -r $ROOT ]] || die "Root is not readable: $ROOT"
+
+root_abs=$(cd -- "$ROOT" && pwd -P) || die "Cannot resolve root: $ROOT"
+
+out_dir_input=$(dirname -- "$OUTPUT")
+out_base=$(basename -- "$OUTPUT")
+
+[[ -d $out_dir_input ]] || die "Output directory does not exist: $out_dir_input"
+out_dir_abs=$(cd -- "$out_dir_input" && pwd -P) || die "Cannot resolve output directory"
+[[ -w $out_dir_abs ]] || die "Output directory is not writable: $out_dir_abs"
+
+out_abs="$out_dir_abs/$out_base"
+[[ ! -d $out_abs ]] || die "Output path is a directory: $OUTPUT"
+
+csv_escape_var() {
+  local s=$1
+  if [[ $s == *","* || $s == *"\""* || $s == *$'\n'* || $s == *$'\r'* ]]; then
+    s=${s//\"/\"\"}
+    printf -v "$2" '"%s"' "$s"
+  else
+    printf -v "$2" '%s' "$s"
+  fi
+}
+
+json_escape_var() {
+  local s=$1
+  local out=""
+  local i ch code
+
+  for (( i=0; i<${#s}; i++ )); do
+    ch=${s:i:1}
+    case "$ch" in
+      '"') out+="\\\"" ;;
+      '\') out+=$'\\' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch" 2>/dev/null || code=0
+        if (( code < 32 )); then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+=$ch
+        fi
+        ;;
+    esac
+  done
+
+  printf -v "$2" '"%s"' "$out"
+}
+
+process_file() {
+  local path=$1
+  local base=${path##*/}
+  local pat
+
+  for pat in "${EXCLUDES[@]}"; do
+    # shellcheck disable=SC2254
+    case "$base" in $pat)
+      log DEBUG "Excluded by basename pattern: $path"
+      return 0
+      ;;
+    esac
+    # shellcheck disable=SC2254
+    case "$path" in $pat)
+      log DEBUG "Excluded by path pattern: $path"
+      return 0
+      ;;
+    esac
+  done
+
+  if [[ $path == "$out_abs" ]]; then
+    return 0
+  fi
+  if [[ -n ${TEMP_FILE:-} && $path == "$TEMP_FILE" ]]; then
+    return 0
+  fi
+
+  local stat_line size mtime ftype owner group sha
+  if ! stat_line=$(stat -c '%s|%Y|%F|%U|%G' -- "$path" 2>/dev/null); then
+    log WARN "Cannot stat: $path"
+    return 0
+  fi
+
+  IFS='|' read -r size mtime ftype owner group <<< "$stat_line"
+
+  if [[ $ftype == "regular file" && -n $MAX_SIZE && $size -gt $MAX_SIZE ]]; then
+    log DEBUG "Skipped by max-size: $path"
+    return 0
+  fi
+
+  sha=""
+  if [[ $ftype == "regular file" ]]; then
+    if (( DRY_RUN == 1 )); then
+      sha="DRY_RUN"
+    else
+      if ! sha=$(sha256sum -- "$path" 2>/dev/null | awk '{print $1}'); then
+        log WARN "Cannot compute SHA-256: $path"
+        sha=""
+      fi
+    fi
+  fi
+
+  if (( DRY_RUN == 1 )); then
+    log INFO "Would index: $path"
+    return 0
+  fi
+
+  local esc_path esc_type esc_owner esc_group esc_sha
+
+  if [[ $FORMAT == csv ]]; then
+    csv_escape_var "$path" esc_path
+    csv_escape_var "$ftype" esc_type
+    csv_escape_var "$owner" esc_owner
+    csv_escape_var "$group" esc_group
+    csv_escape_var "$sha" esc_sha
+
+    printf '%s,%s,%s,%s,%s,%s,%s\n' \
+      "$esc_path" "$size" "$mtime" "$esc_type" "$esc_sha" "$esc_owner" "$esc_group" \
+      >> "$TEMP_FILE"
+  else
+    json_escape_var "$path" esc_path
+    json_escape_var "$ftype" esc_type
+    json_escape_var "$owner" esc_owner
+    json_escape_var "$group" esc_group
+    json_escape_var "$sha" esc_sha
+
+    printf '{"path":%s,"size":%s,"mtime":%s,"type":%s,"sha256":%s,"owner":%s,"group":%s}\n' \
+      "$esc_path" "$size" "$mtime" "$esc_type" "$esc_sha" "$esc_owner" "$esc_group" \
+      >> "$TEMP_FILE"
+  fi
+}
+
+if (( DRY_RUN == 0 )); then
+  TEMP_FILE=$(mktemp "$out_dir_abs/.file-index.XXXXXX") || die "mktemp failed"
+  log INFO "Writing temporary file: $TEMP_FILE"
+
+  if [[ $FORMAT == csv ]]; then
+    printf 'absolute_path,size,mtime,type,sha256,owner,group\n' > "$TEMP_FILE"
+  fi
+else
+  log INFO "DRY-RUN: would write to $out_abs"
+fi
+
+log INFO "Indexing root: $root_abs"
+
+while IFS= read -r -d '' path; do
+  process_file "$path"
+done < <(find "$root_abs" -mindepth 1 -print0 2>/dev/null)
+
+if (( DRY_RUN == 1 )); then
+  log INFO "DRY-RUN complete"
+  exit 0
+fi
+
+if [[ -n ${TEMP_FILE:-} && -f $TEMP_FILE ]]; then
+  mv -f -- "$TEMP_FILE" "$out_abs" || die "Cannot move temporary file to output"
+  TEMP_FILE=""
+  log INFO "Wrote index: $out_abs"
+else
+  die "Temporary file missing"
+fi
