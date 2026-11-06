@@ -1,0 +1,22 @@
+name: Bash CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      
+      - name: Run ShellCheck
+        run: shellcheck -x libbashkit.sh bashkit
+        
+      - name: Setup Bats
+        run: |
+          git clone https://github.com/bats-core/bats-core.git tests/bats-core
+          
+      - name: Run Tests
+        run: bash tests/bats-core/bin/bats tests/test_bashkit.bats

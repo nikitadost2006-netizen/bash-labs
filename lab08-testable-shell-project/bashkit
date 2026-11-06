@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Подключаем библиотеку
+# shellcheck source=libbashkit.sh
+source "$SCRIPT_DIR/libbashkit.sh"
+
+usage() {
+  cat <<USAGE
+Usage: $PROG --dir DIR --config FILE --output FILE
+
+Options:
+  --dir DIR          Directory to validate
+  --config FILE      Config file (key=value)
+  --output FILE      Output JSON report
+  --help             Show help
+  --version          Show version
+USAGE
+}
+
+DIR=""
+CONFIG=""
+OUTPUT=""
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$PROG 1.0.0"; exit 0 ;;
+    --dir) DIR=$2; shift 2 ;;
+    --config) CONFIG=$2; shift 2 ;;
+    --output) OUTPUT=$2; shift 2 ;;
+    *) log_msg "ERROR" "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+[[ -n "$DIR" ]] || { log_msg "ERROR" "--dir is required"; exit 1; }
+[[ -n "$CONFIG" ]] || { log_msg "ERROR" "--config is required"; exit 1; }
+[[ -n "$OUTPUT" ]] || { log_msg "ERROR" "--output is required"; exit 1; }
+
+# Проверка зависимостей
+check_required_cmds find stat sha256sum || exit 1
+
+# Читаем конфиг
+ALLOWED_EXT=$(get_config_val "$CONFIG" "allowed_ext" ".txt")
+MAX_SIZE=$(get_config_val "$CONFIG" "max_size" "1048576")
+
+log_msg "INFO" "Validating $DIR (ext: $ALLOWED_EXT, max_size: $MAX_SIZE)"
+
+create_temp_workspace
+TMP_JSON="$BASHKIT_TMP_DIR/report.json"
+
+echo "[" > "$TMP_JSON"
+first=1
+
+process_file() {
+  local file=$1
+  local size ext status reason
+  size=$(stat -c "%s" "$file")
+  ext=".${file##*.}"
+  
+  status="ok"
+  reason=""
+
+  if [[ ",$ALLOWED_EXT," != *",$ext,"* ]]; then
+    status="error"
+    reason="bad_extension"
+  elif (( size > MAX_SIZE )); then
+    status="error"
+    reason="size_too_large"
+  fi
+
+  local s_file s_reason
+  s_file=$(json_escape "$file")
+  s_reason=$(json_escape "$reason")
+
+  if [[ $first -eq 0 ]]; then
+    echo "," >> "$TMP_JSON"
+  fi
+  first=0
+
+  echo -n "  {\"file\":\"$s_file\",\"status\":\"$status\",\"reason\":\"$s_reason\"}" >> "$TMP_JSON"
+}
+
+safe_process_paths "$DIR" process_file
+
+echo "" >> "$TMP_JSON"
+echo "]" >> "$TMP_JSON"
+
+# Атомарно перемещаем результат
+mv "$TMP_JSON" "$OUTPUT"
+log_msg "INFO" "Report saved to $OUTPUT"
