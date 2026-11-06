@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-11-06T17:55:16Z",
+  "duration_sec": 1,
+  "errors": 0,
+  "sections": [
+    {"name": "disk", "file": "raw/disk.txt"},
+    {"name": "inodes", "file": "raw/inodes.txt"},
+    {"name": "logs", "file": "raw/logs.txt"},
+    {"name": "mem", "file": "raw/mem.txt"},
+    {"name": "os", "file": "raw/os.txt"},
+    {"name": "proc", "file": "raw/proc.txt"}
+  ]
+}

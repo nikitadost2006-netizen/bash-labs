@@ -1,0 +1,13 @@
+=== Date: Fri Nov  6 21:03:12 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - missing args
+ok 3 - dry-run creates no files
+ok 4 - basic collection
+ok 5 - reports created
+ok 6 - protects existing report
+ok 7 - redaction works
+ok 8 - checksums created
+ok 9 - http probe
+ok 10 - partial fail exit code
+1..10

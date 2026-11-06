@@ -1,0 +1,4 @@
+2026-11-06 12:00:00 INFO Starting service
+2026-11-06 12:00:01 DEBUG Connecting to DB with password=***
+2026-11-06 12:00:02 ERROR Auth failed for token=***
+2026-11-06 12:00:03 INFO Request /api/v1/users
