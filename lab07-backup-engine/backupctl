@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+TMP_DIR=""
+
+usage() {
+  cat <<USAGE
+Usage: $PROG <command> [options]
+
+Commands:
+  init --repo DIR
+  create --repo DIR --source DIR [--label NAME]
+  list --repo DIR
+  verify --repo DIR --id ID
+  restore --repo DIR --id ID --target DIR [--dry-run]
+  prune --repo DIR --keep N [--dry-run]
+
+Options:
+  --help             Show this help
+  --version          Show version
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+cleanup() {
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
+
+CMD=$1
+shift
+
+REPO=""
+SOURCE=""
+LABEL="default"
+ID=""
+TARGET=""
+KEEP=""
+DRY_RUN=0
+
+case "$CMD" in
+  --help) usage; exit 0 ;;
+  --version) echo "$PROG $VERSION"; exit 0 ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --repo) [[ $# -ge 2 ]] || die "--repo requires arg"; REPO=$2; shift 2 ;;
+    --repo=*) REPO=${1#*=}; shift ;;
+    --source) [[ $# -ge 2 ]] || die "--source requires arg"; SOURCE=$2; shift 2 ;;
+    --source=*) SOURCE=${1#*=}; shift ;;
+    --label) [[ $# -ge 2 ]] || die "--label requires arg"; LABEL=$2; shift 2 ;;
+    --label=*) LABEL=${1#*=}; shift ;;
+    --id) [[ $# -ge 2 ]] || die "--id requires arg"; ID=$2; shift 2 ;;
+    --id=*) ID=${1#*=}; shift ;;
+    --target) [[ $# -ge 2 ]] || die "--target requires arg"; TARGET=$2; shift 2 ;;
+    --target=*) TARGET=${1#*=}; shift ;;
+    --keep) [[ $# -ge 2 ]] || die "--keep requires arg"; KEEP=$2; shift 2 ;;
+    --keep=*) KEEP=${1#*=}; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$REPO" ]] || die "--repo is required"
+REPO=$(cd "$REPO" 2>/dev/null && pwd -P) || die "Repo does not exist"
+
+case "$CMD" in
+  init)
+    mkdir -p "$REPO/archives" "$REPO/manifests" "$REPO/meta"
+    echo "Initialized empty backup repository in $REPO"
+    ;;
+
+  create)
+    [[ -d "$SOURCE" ]] || die "Source directory not found: $SOURCE"
+    SOURCE=$(cd "$SOURCE" && pwd -P)
+    
+    # Проверка свободного места (с защитой от пустого вывода df в Git Bash)
+    FREE_KB=$(df -Pk "$REPO" | awk 'NR==2 {print $4}')
+    if [[ -n "$FREE_KB" ]] && (( FREE_KB < 1024 )); then
+      die "Not enough free space in repo (need at least 1MB)"
+    fi
+
+    ID=$(date +%Y%m%d_%H%M%S)
+    ID="${ID}_$((RANDOM % 1000))"
+    LABEL_SAFE=$(echo "$LABEL" | tr -cd '[:alnum:]_')
+    [[ -n "$LABEL_SAFE" ]] || LABEL_SAFE="default"
+    
+    ARCHIVE_NAME="${ID}_${LABEL_SAFE}.tar.gz"
+    ARCHIVE_PATH="$REPO/archives/$ARCHIVE_NAME"
+    MANIFEST_PATH="$REPO/manifests/${ID}.tsv"
+    SHA_PATH="$REPO/meta/${ID}.sha256"
+
+    TMP_DIR=$(mktemp -d "$REPO/meta/tmp.XXXXXX")
+    echo "Creating backup $ID..."
+    
+    # 1. Создаем манифест
+    echo -e "path\tsize\tmtime\tsha256" > "$MANIFEST_PATH"
+    while IFS= read -r -d '' file; do
+      rel_path="${file#"$SOURCE"/}"
+      [[ "$file" == "$SOURCE" ]] && continue
+      
+      stat_out=$(stat -c "%s|%Y" "$file")
+      size="${stat_out%|*}"
+      mtime="${stat_out#*|}"
+      
+      sha=""
+      if [[ -f "$file" ]]; then
+        sha=$(sha256sum "$file" | awk '{print $1}')
+      fi
+      echo -e "${rel_path}\t${size}\t${mtime}\t${sha}" >> "$MANIFEST_PATH"
+    done < <(find "$SOURCE" -print0)
+
+    # 2. Создаем архив (атомарно)
+    tar -czf "${ARCHIVE_PATH}.tmp" -C "$SOURCE" . || die "Tar failed"
+    mv "${ARCHIVE_PATH}.tmp" "$ARCHIVE_PATH"
+    
+    # 3. Сохраняем контрольную сумму архива
+    sha256sum "$ARCHIVE_PATH" | awk '{print $1}' > "$SHA_PATH"
+
+    echo "Backup created: $ID"
+    echo "Archive: $ARCHIVE_NAME"
+    echo "Manifest: $MANIFEST_PATH"
+    ;;
+
+  list)
+    echo "ID | LABEL | SIZE"
+    echo "----------------"
+    for m in "$REPO/manifests"/*.tsv; do
+      [[ -e "$m" ]] || continue
+      b_id=$(basename "$m" .tsv)
+      arch=$(ls "$REPO/archives/${b_id}"_*.tar.gz 2>/dev/null | head -n 1)
+      if [[ -n "$arch" ]]; then
+        sz=$(du -h "$arch" | awk '{print $1}')
+        name=$(basename "$arch" .tar.gz)
+        label=${name#*_}
+        echo "$b_id | $label | $sz"
+      fi
+    done
+    ;;
+
+  verify)
+    [[ -n "$ID" ]] || die "--id is required"
+    [[ -f "$REPO/meta/$ID.sha256" ]] || die "Meta not found for $ID"
+    arch=$(ls "$REPO/archives/${ID}"_*.tar.gz 2>/dev/null | head -n 1)
+    [[ -f "$arch" ]] || die "Archive not found for $ID"
+
+    expected_sha=$(cat "$REPO/meta/$ID.sha256")
+    actual_sha=$(sha256sum "$arch" | awk '{print $1}')
+
+    if [[ "$expected_sha" == "$actual_sha" ]]; then
+      echo "OK: Archive $ID is valid."
+    else
+      echo "ERROR: Archive $ID is corrupted!" >&2
+      exit 1
+    fi
+    ;;
+
+  restore)
+    [[ -n "$ID" ]] || die "--id is required"
+    [[ -n "$TARGET" ]] || die "--target is required"
+    arch=$(ls "$REPO/archives/${ID}"_*.tar.gz 2>/dev/null | head -n 1)
+    [[ -f "$arch" ]] || die "Archive not found for $ID"
+
+    # Защита от Path Traversal (без local)
+    tlist=$(mktemp)
+    tar -tf "$arch" > "$tlist" 2>/dev/null || true
+    
+    if grep -qE '(^|/)\.\.(/|$)' "$tlist"; then
+      rm -f "$tlist"
+      die "SECURITY ERROR: Archive contains path traversal sequences (../)!"
+    fi
+
+    if (( DRY_RUN == 1 )); then
+      echo "DRY-RUN: Would restore $ID to $TARGET"
+      file_count=$(wc -l < "$tlist")
+      rm -f "$tlist"
+      echo "Archive contains $file_count files."
+      exit 0
+    fi
+    rm -f "$tlist"
+
+    mkdir -p "$TARGET"
+    if [[ -n "$(ls -A "$TARGET" 2>/dev/null)" ]]; then
+      die "Target directory is not empty. Refusing to overwrite."
+    fi
+
+    echo "Restoring $ID to $TARGET..."
+    tar -xzf "$arch" -C "$TARGET"
+    echo "Restore complete."
+    ;;
+
+  prune)
+    [[ -n "$KEEP" ]] || die "--keep is required"
+    [[ "$KEEP" =~ ^[0-9]+$ ]] || die "--keep must be an integer"
+    
+    archives=($(ls "$REPO/archives"/*.tar.gz 2>/dev/null | sort))
+    count=${#archives[@]}
+    
+    if (( count <= KEEP )); then
+      echo "Nothing to prune. $count archives <= $KEEP."
+      exit 0
+    fi
+
+    to_delete=$(( count - KEEP ))
+    for (( i=0; i<to_delete; i++ )); do
+      arch="${archives[$i]}"
+      b_id=$(basename "$arch" | cut -d'_' -f1)
+      if (( DRY_RUN == 1 )); then
+        echo "DRY-RUN: Would delete $b_id"
+      else
+        echo "Deleting $b_id..."
+        rm -f "$arch" "$REPO/manifests/$b_id.tsv" "$REPO/meta/$b_id.sha256"
+      fi
+    done
+    ;;
+
+  *)
+    die "Unknown command: $CMD"
+    ;;
+esac

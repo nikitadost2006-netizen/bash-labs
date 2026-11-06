@@ -1,0 +1,23 @@
+=== Date: Fri Nov  6 20:35:14 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - init
+ok 3 - create
+ok 4 - list
+ok 5 - verify success
+ok 6 - verify corrupted fails
+ok 7 - restore dry-run
+ok 8 - restore actual
+ok 9 - restored file exists
+ok 10 - prune dry-run
+1..10
+=== Sample Run ===
+Initialized empty backup repository in /c/Users/nikit/projects/bash-labs/lab07-backup-engine/my_repo
+Creating backup 20261106_203517_883...
+Backup created: 20261106_203517_883
+Archive: 20261106_203517_883_demo.tar.gz
+Manifest: /c/Users/nikit/projects/bash-labs/lab07-backup-engine/my_repo/manifests/20261106_203517_883.tsv
+ID | LABEL | SIZE
+----------------
+20261106_202253 | 202253_test | 1.0K
+20261106_203517_883 | 203517_883_demo | 1.0K
