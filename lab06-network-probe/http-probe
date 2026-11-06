@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+INPUT=""
+FORMAT="text"
+ONCE=0
+INTERVAL=0
+TIMEOUT=10
+RETRIES=0
+
+usage() {
+  cat <<USAGE
+Usage: $PROG --input FILE [OPTIONS]
+
+Options:
+  --input FILE       File with services (NAME URL EXPECTED_STATUS) (required)
+  --format text|jsonl|prometheus Output format (default: text)
+  --once             Run once and exit (default)
+  --interval N       Run continuously every N seconds
+  --timeout N        Timeout in seconds (default: 10)
+  --retries N        Number of retries on failure (default: 0)
+  --help             Show this help
+  --version          Show version
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$PROG $VERSION"; exit 0 ;;
+    --input) [[ $# -ge 2 ]] || die "--input requires argument"; INPUT=$2; shift 2 ;;
+    --input=*) INPUT=${1#*=}; shift ;;
+    --format) [[ $# -ge 2 ]] || die "--format requires argument"; FORMAT=$2; shift 2 ;;
+    --format=*) FORMAT=${1#*=}; shift ;;
+    --once) ONCE=1; shift ;;
+    --interval) [[ $# -ge 2 ]] || die "--interval requires argument"; INTERVAL=$2; shift 2 ;;
+    --interval=*) INTERVAL=${1#*=}; shift ;;
+    --timeout) [[ $# -ge 2 ]] || die "--timeout requires argument"; TIMEOUT=$2; shift 2 ;;
+    --timeout=*) TIMEOUT=${1#*=}; shift ;;
+    --retries) [[ $# -ge 2 ]] || die "--retries requires argument"; RETRIES=$2; shift 2 ;;
+    --retries=*) RETRIES=${1#*=}; shift ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) die "Unexpected argument: $1" ;;
+  esac
+done
+
+[[ -n $INPUT ]] || die "--input is required"
+[[ -f $INPUT ]] || die "Input file not found: $INPUT"
+[[ $FORMAT =~ ^(text|jsonl|prometheus)$ ]] || die "Invalid format: $FORMAT"
+
+# Защита от утечки секретов в URL (пароли вроде https://user:pass@host)
+mask_url() {
+  local url=$1
+  if [[ "$url" =~ ^(https?://)([^:]+):([^@]+)@(.*)$ ]]; then
+    echo "${BASH_REMATCH[1]}***:***@${BASH_REMATCH[4]}"
+  else
+    echo "$url"
+  fi
+}
+
+# Экранирование кавычек для JSON
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  echo "$s"
+}
+
+probe_service() {
+  local name=$1
+  local url=$2
+  local expected=$3
+  
+  # Проверка валидности URL (только http и https)
+  if [[ ! "$url" =~ ^https?:// ]]; then
+    echo "Invalid URL scheme for $name: $url" >&2
+    return 1
+  fi
+
+  local masked_url
+  masked_url=$(mask_url "$url")
+
+  local attempt=0
+  local success=0
+  local http_code="000"
+  local time_dns="0"
+  local time_connect="0"
+  local time_tls="0"
+  local time_total="0"
+  local err_msg=""
+
+  while (( attempt <= RETRIES )); do
+    # Используем curl с форматом вывода. 
+    # --fail-with-body позволяет считать 4xx/5xx ошибкой, но мы все равно ловим код.
+    # -o /dev/null отбрасывает тело ответа.
+    local curl_out
+    curl_out=$(curl -sS -o /dev/null -w "%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_total}" \
+      --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" --fail-with-body "$url" 2>&1) || true
+
+    if [[ "$curl_out" =~ ^([0-9]{3})\|([0-9.]+)\|([0-9.]+)\|([0-9.]+)\|([0-9.]+)$ ]]; then
+      http_code="${BASH_REMATCH[1]}"
+      time_dns="${BASH_REMATCH[2]}"
+      time_connect="${BASH_REMATCH[3]}"
+      time_tls="${BASH_REMATCH[4]}"
+      time_total="${BASH_REMATCH[5]}"
+      
+      if [[ "$http_code" == "$expected" ]]; then
+        success=1
+        break
+      else
+        err_msg="Expected $expected, got $http_code"
+      fi
+    else
+      err_msg="$curl_out"
+    fi
+
+    attempt=$((attempt + 1))
+    if (( attempt <= RETRIES )); then
+      # Jitter: случайная задержка от 1 до 3 секунд перед повтором
+      local jitter=$(( RANDOM % 3 + 1 ))
+      sleep "$jitter"
+    fi
+  done
+
+  # Вывод результатов
+  if [[ "$FORMAT" == "text" ]]; then
+    if [[ $success -eq 1 ]]; then
+      printf "[OK]   %-10s %s | code: %s | total: %.3fs (dns: %.3fs, conn: %.3fs, tls: %.3fs)\n" \
+        "$name" "$masked_url" "$http_code" "$time_total" "$time_dns" "$time_connect" "$time_tls"
+    else
+      printf "[FAIL] %-10s %s | error: %s\n" "$name" "$masked_url" "$err_msg"
+    fi
+  elif [[ "$FORMAT" == "jsonl" ]]; then
+    local s_name s_url s_err
+    s_name=$(json_escape "$name")
+    s_url=$(json_escape "$masked_url")
+    s_err=$(json_escape "$err_msg")
+    printf '{"service":"%s","url":"%s","success":%s,"http_code":"%s","time_total":%s,"time_dns":%s,"time_connect":%s,"time_tls":%s,"error":"%s"}\n' \
+      "$s_name" "$s_url" "$success" "$http_code" "$time_total" "$time_dns" "$time_connect" "$time_tls" "$s_err"
+  elif [[ "$FORMAT" == "prometheus" ]]; then
+    local status_val=$([[ $success -eq 1 ]] && echo 1 || echo 0)
+    echo "http_probe_up{service=\"$name\",url=\"$masked_url\"} $status_val"
+    echo "http_probe_duration_seconds{service=\"$name\",phase=\"total\"} $time_total"
+    echo "http_probe_duration_seconds{service=\"$name\",phase=\"dns\"} $time_dns"
+    echo "http_probe_duration_seconds{service=\"$name\",phase=\"connect\"} $time_connect"
+    echo "http_probe_duration_seconds{service=\"$name\",phase=\"tls\"} $time_tls"
+  fi
+
+  [[ $success -eq 1 ]]
+}
+
+# --- Основной цикл ---
+main_loop() {
+  local failed=0
+  
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Пропускаем пустые строки и комментарии
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    
+    # Разбиваем строку на имя, URL и ожидаемый код
+    local name url expected
+    read -r name url expected <<< "$line"
+    
+    if ! probe_service "$name" "$url" "${expected:-200}"; then
+      failed=$((failed + 1))
+    fi
+  done < <(tr -d '\r' < "$INPUT")
+
+  if [[ $failed -gt 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$ONCE" -eq 1 || "$INTERVAL" -eq 0 ]]; then
+  main_loop
+else
+  while true; do
+    main_loop || true
+    sleep "$INTERVAL"
+  done
+fi

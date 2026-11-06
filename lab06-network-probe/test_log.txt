@@ -1,0 +1,19 @@
+=== Date: Fri Nov  6 20:17:15 RTZ 2026 ===
+=== Tests ===
+ok 1 - help
+ok 2 - missing input
+ok 3 - invalid format
+ok 4 - invalid scheme
+ok 5 - text output OK
+ok 6 - fails on bad code
+ok 7 - jsonl format
+ok 8 - prometheus format
+ok 9 - retries handled gracefully
+ok 10 - secrets masked
+1..10
+=== Sample Run ===
+[OK]   google     https://www.google.com | code: 200 | total: 0.447s (dns: 0.020s, conn: 0.074s, tls: 0.178s)
+[OK]   github     https://github.com | code: 200 | total: 1.320s (dns: 0.026s, conn: 0.097s, tls: 0.187s)
+[OK]   httpbin    https://httpbin.org/status/200 | code: 200 | total: 0.635s (dns: 0.033s, conn: 0.231s, tls: 0.440s)
+[FAIL] badsite    https://httpbin.org/status/500 | error: curl: (22) The requested URL returned error: 500
+500|0.010201|0.220737|0.444422|0.654362
